@@ -1,0 +1,191 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index de132ee..499e6bd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,7 +47,7 @@ if(GSV_GGML_LIB_DIR)
+         message(FATAL_ERROR "no ggml libraries under '${GSV_GGML_LIB_DIR}' (set GSV_GGML_LIB_DIR or clear it to build llama.cpp as a subproject)")
+     endif()
+ else()
+-    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
++    set(GGML_VULKAN OFF CACHE BOOL "" FORCE) # macOS patch: use native Metal instead of Vulkan
+     set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+     set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+     add_subdirectory("${GSV_LLAMA_DIR}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
+diff --git a/frontend/GPT_SoVITS/text/g2pw/polyphonic.md5 b/frontend/GPT_SoVITS/text/g2pw/polyphonic.md5
+index 24182cb..6095e52 100644
+--- a/frontend/GPT_SoVITS/text/g2pw/polyphonic.md5
++++ b/frontend/GPT_SoVITS/text/g2pw/polyphonic.md5
+@@ -1 +1 @@
+-13b2211c317c75794123ffdf7c2aea021c75b0c606ad61d7c8b05bb00b64fa21
+\ No newline at end of file
++e5112f5800e8b41a4a94be20c5c18bf1bda17950d87be0788f712e0bf1b9ed36
+\ No newline at end of file
+diff --git a/frontend/GPT_SoVITS/text/ja_userdic/userdict.md5 b/frontend/GPT_SoVITS/text/ja_userdic/userdict.md5
+index d38206b..7848c97 100644
+--- a/frontend/GPT_SoVITS/text/ja_userdic/userdict.md5
++++ b/frontend/GPT_SoVITS/text/ja_userdic/userdict.md5
+@@ -1 +1 @@
+-878b3caf4d1cd7c2927c26e85072a2f5
+\ No newline at end of file
++d36bd5ffba62f195d22bf4f1a41cd08f
+\ No newline at end of file
+diff --git a/src/gsv_dit.cpp b/src/gsv_dit.cpp
+index 7b71fe2..d45c4a3 100644
+--- a/src/gsv_dit.cpp
++++ b/src/gsv_dit.cpp
+@@ -185,7 +185,13 @@ struct gsv_dit::impl {
+     // LN(x) * (1 + scale) + shift in one pass (patch op layernorm_affine, wb = [w, b]).
+     static ggml_tensor * modulate_ln(ggml_context * c, ggml_tensor * x, ggml_tensor * scale,
+                                      ggml_tensor * shift, ggml_tensor * ones) {
++        // macOS patch: GSV_DIT_NO_FUSE_LN=1 -> decompose to standard norm/mul/add (Metal path)
++        static const bool no_fuse = getenv("GSV_DIT_NO_FUSE_LN") != nullptr;
+         ggml_tensor * w  = ggml_add(c, scale, ones);
++        if (no_fuse) {
++            ggml_tensor * ln = ggml_norm(c, x, NORM_EPS);
++            return ggml_add(c, ggml_mul(c, ln, w), shift);
++        }
+         ggml_tensor * wb = ggml_concat(c, w, shift, 0);
+         return ggml_layernorm_affine(c, x, nullptr, nullptr, wb, NORM_EPS);
+     }
+diff --git a/src/gsv_hubert.cpp b/src/gsv_hubert.cpp
+index 4a2dec3..4f42585 100644
+--- a/src/gsv_hubert.cpp
++++ b/src/gsv_hubert.cpp
+@@ -13,7 +13,12 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <chrono>
++#if defined(__aarch64__) || defined(__arm__)
++#include <arm_neon.h>
++#define GSV_ARCH_NEON 1
++#else
+ #include <immintrin.h>
++#endif
+ #include <string>
+ #include <vector>
+ 
+@@ -567,7 +572,11 @@ static void hubert_pos_conv(const std::vector<float> & x, int T,
+     //   => 每个 w 元素只读一遍 (18.9MB), x 留在 L1/L2
+     // 累加顺序 (ic, k 递增) 与初版 (k, ic 递增) 不同 —— 见下方 N 顺序说明
+     // 内核一次覆盖 56 帧 (7 个 YMM 累加器); 长音频按 56 帧分块 (块内 (ic,k) 累加顺序不变 -> 数值不变)
+-    const int FB = 56;
++#if defined(GSV_ARCH_NEON)
++    const int FB = 28;   // NEON 128-bit: 7 acc x 4 lanes
++#else
++    const int FB = 56;   // AVX2 256-bit: 7 acc x 8 lanes
++#endif
+ #pragma omp parallel for schedule(static) collapse(2)
+     for (int g = 0; g < G; g++) {
+         for (int ob = 0; ob < CG; ob += 8) {
+@@ -576,7 +585,31 @@ static void hubert_pos_conv(const std::vector<float> & x, int T,
+                 for (int o = 0; o < 8; o++) {
+                     const int c = g * CG + ob + o;
+                     const float * wp = w + (size_t)c * (CG * K);
+-                    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
++                    #if defined(GSV_ARCH_NEON)
++                    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
++                    float32x4_t a4 = a0, a5 = a0, a6 = a0;
++                    for (int ic = 0; ic < CG; ic++) {
++                        const float * xp = &xt[(size_t)(g * CG + ic) * TPAD + tb];
++                        const float * wrow = wp + (size_t)ic * K;
++                        for (int k = 0; k < K; k++) {
++                            const float32x4_t wv = vdupq_n_f32(wrow[k]);
++                            const float * xb = xp + k;
++                            a0 = vfmaq_f32(a0, wv, vld1q_f32(xb));
++                            a1 = vfmaq_f32(a1, wv, vld1q_f32(xb + 4));
++                            a2 = vfmaq_f32(a2, wv, vld1q_f32(xb + 8));
++                            a3 = vfmaq_f32(a3, wv, vld1q_f32(xb + 12));
++                            a4 = vfmaq_f32(a4, wv, vld1q_f32(xb + 16));
++                            a5 = vfmaq_f32(a5, wv, vld1q_f32(xb + 20));
++                            a6 = vfmaq_f32(a6, wv, vld1q_f32(xb + 24));
++                        }
++                    }
++                    float tmp[64];
++                    vst1q_f32(tmp,      a0); vst1q_f32(tmp + 4,  a1);
++                    vst1q_f32(tmp + 8,  a2); vst1q_f32(tmp + 12, a3);
++                    vst1q_f32(tmp + 16, a4); vst1q_f32(tmp + 20, a5);
++                    vst1q_f32(tmp + 24, a6);
++#else
++__m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                     __m256 a4 = a0, a5 = a0, a6 = a0;
+                     for (int ic = 0; ic < CG; ic++) {
+                         const float * xp = &xt[(size_t)(g * CG + ic) * TPAD + tb];
+@@ -598,6 +631,7 @@ static void hubert_pos_conv(const std::vector<float> & x, int T,
+                     _mm256_storeu_ps(tmp + 16, a2); _mm256_storeu_ps(tmp + 24, a3);
+                     _mm256_storeu_ps(tmp + 32, a4); _mm256_storeu_ps(tmp + 40, a5);
+                     _mm256_storeu_ps(tmp + 48, a6);
++#endif
+                     float * yc = &y[(size_t)c];
+                     for (int t = 0; t < nb; t++) {
+                         const float v = tmp[t] + bias[c];
+diff --git a/src/gsv_vocoder_ggml.cpp b/src/gsv_vocoder_ggml.cpp
+index ed70d66..491a036 100644
+--- a/src/gsv_vocoder_ggml.cpp
++++ b/src/gsv_vocoder_ggml.cpp
+@@ -54,6 +54,24 @@ struct gsv_vocoder_ggml::impl {
+ 
+     // Stride-1 conv1d with the whole epilogue fused: bias + leaky out, optional input
+     // scale/leaky (CONV_DIRECT_1D: no im2col buffer, CPU + Vulkan).
++    // macOS patch: F32-exact conv1d for the decomposed Metal path.
++    // ggml_conv_1d casts im2col to F16 (fatal for 40-layer waveform gen);
++    // this keeps the im2col buffer F32 to match conv_direct_1d_fused numerics.
++    static ggml_tensor * conv_1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
++                                     int stride, int pad, int dil) {
++        // stock im2col (battle-tested ordering) with explicit F32 buffer:
++        // fast_1d variant pairs with a different IC*K packing order -> noise (ablation-proven)
++        ggml_tensor * im2col = ggml_im2col(c, w, x, stride, 0, pad, 0, dil, 0, false, GGML_TYPE_F32);
++        ggml_tensor * y = ggml_mul_mat(c,
++                ggml_reshape_2d(c, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
++                ggml_reshape_2d(c, w, w->ne[0] * w->ne[1], w->ne[2]));
++        return ggml_reshape_3d(c, y, im2col->ne[1], w->ne[2], im2col->ne[2]); // [OL, OC, N]
++    }
++    static ggml_tensor * act_epilogue(ggml_context * c, ggml_tensor * y, float slope) {
++        if (slope == 0.0f) return y;
++        if (slope < 0.0f)  return ggml_tanh(c, y);   // fused语义: slope<0 == tanh
++        return ggml_leaky_relu(c, y, slope, true);
++    }
+     ggml_tensor * conv_same(ggml_context * c, const std::string & pre, ggml_tensor * x,
+                             int dil, float leaky, float in_scale = 1.0f, float in_slope = 0.0f,
+                             ggml_tensor * res = nullptr) {
+@@ -61,6 +79,21 @@ struct gsv_vocoder_ggml::impl {
+         if (!ww) return nullptr;
+         const int64_t K   = ww->ne[0];
+         const int64_t pad = (K / 2) * dil;
++        // macOS patch: GSV_VOC_NO_FUSED=1 -> decompose to standard ops (Metal path).
++        // Math: y = leaky(conv(x)*s + b + res, slope) with input pre-leaky when in_slope>0.
++        static const bool no_fused = getenv("GSV_VOC_NO_FUSED") != nullptr;
++        if (no_fused) {
++            ggml_tensor * h = x;
++            if (in_scale != 1.0f || in_slope != 0.0f) {
++                h = ggml_leaky_relu(c, ggml_scale(c, h, in_scale), in_slope, true);
++            }
++            ggml_tensor * y = conv_1d_f32(c, ww, h, 1, pad, dil);
++            ggml_tensor * b = ggml_reshape_2d(c, need(pre + ".bias"), 1, ww->ne[2]); // [1,OC] broadcast
++            y = ggml_add(c, y, b);
++            if (res) y = ggml_add(c, y, res);
++            y = act_epilogue(c, y, leaky);
++            return ggml_reshape_2d(c, y, y->ne[0], y->ne[1]); // [OL,OC] 与 fused 版同形
++        }
+         return ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), res,
+                                          (int) pad, dil, leaky, in_scale, in_slope);
+     }
+@@ -75,7 +108,18 @@ struct gsv_vocoder_ggml::impl {
+         const int CS  = (int) ww->ne[2];
+         const int cout = CS / stride;
+         const int64_t L = x->ne[0];
+-        ggml_tensor * y = ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), nullptr,
++        static const bool no_fused_up = getenv("GSV_VOC_NO_FUSED") != nullptr;
++        ggml_tensor * y;
++        if (no_fused_up) {
++            ggml_tensor * h = x;
++            if (in_scale != 1.0f || in_slope != 0.0f) {
++                h = ggml_leaky_relu(c, ggml_scale(c, h, in_scale), in_slope, true);
++            }
++            y = conv_1d_f32(c, ww, h, 1, M / 2, 1);
++            ggml_tensor * bb = ggml_reshape_2d(c, need(pre + ".bias"), 1, ww->ne[2]);
++            y = ggml_add(c, y, bb);
++        } else
++        y = ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), nullptr,
+                                                     M / 2, 1, 0.0f, in_scale, in_slope);
+         if (y->ne[0] != L) {
+             // symmetric pad produced M-1 extra rows on the right; keep the first L
