@@ -5,7 +5,7 @@ if lsof -ti :9880 >/dev/null 2>&1 && lsof -ti :9881 >/dev/null 2>&1 && lsof -ti 
     echo "[gsv] services already up, skip"
     exit 0
 fi
-GSV=/Users/raoye/Desktop/vcp/下载查看/gsv.cpp-macos验证/gsv.cpp
+GSV=/Users/raoye/Desktop/vcp/脚本库/gsv.cpp-macos/gsv.cpp
 CERT=$("$GSV/.venv-sidecar/bin/python" -c "import certifi; print(certifi.where())")
 for pid in $(lsof -ti :9882 2>/dev/null); do kill -9 $pid 2>/dev/null; done
 for pid in $(lsof -ti :9880 2>/dev/null); do kill -9 $pid 2>/dev/null; done

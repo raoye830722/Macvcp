@@ -53,3 +53,16 @@ AI 将会理解您的意图，并调用 VCPEverything 插件来执行搜索，�
 次要原因：您在插件 .env 文件中配置的 EVERYTHING_PORT 与 Everything 选项中实际设置的端口号不一致。请仔细检查并确保两者完全相同。
 
 其他原因：您的防火墙或安全软件可能阻止了 VCP 服务器对 Everything 端口的本地访问。请检查相关设置。
+
+---
+
+## macOS 适配说明（本仓库版）
+
+上游原版依赖 Windows Everything 的 HTTP 服务器（见上文），macOS 无 Everything 服务。本仓库版本已适配 macOS：
+
+- 以系统 Spotlight（mdfind）替代 Everything HTTP 服务，零外部依赖
+- `local-search-controller.js` 平台分叉 +246 行：darwin 分支走 mdfind
+- `.env` 配置项不同：macOS 版为 mdfind 范围/超时；`EVERYTHING_PORT` 等键仅 Windows 分支消费
+- 依赖：Spotlight 索引开启（`mdutil -s /` 检查索引状态，搜索为空先查索引不是插件坏了）
+
+Windows 部署请按上文原版说明配置 Everything HTTP 服务器；macOS 用户直接使用本仓库版本即可。
