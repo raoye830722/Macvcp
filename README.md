@@ -22,5 +22,15 @@ VCP（Variable & Command Protocol）——「给 AI 一个持续存在的世界�
 - **本地搜索**：以 Spotlight（mdfind）替代 Windows Everything 实现本地文件秒搜
 - **路径与安全**：FileOperator 白名单 macOS 路径化
 - **桌面操控**：ScreenPilot 的 darwin 通道（osascript / AppleScript）
+- **语音克隆**：gsv.cpp 引擎 Vulkan→Metal 编译适配 + VCPChat 协议适配层
 
 > ⚠️ 本仓库为 macOS 改造版，可能与上游存在行为差异；生产使用请以上游为准。
+
+## 仓库结构
+
+| 文件夹 | 内容 | 来源 |
+|--------|------|------|
+| `macpowershell/` | 真 pwsh 7.6.3 语义执行器 | VCPChat 插件（已回流上游 PR #356） |
+| `vcpeverything/` | mdfind 替代 Everything 的本地秒搜 | VCPChat 插件 LocalSearchController |
+| `screenpilot/` | Computer Use 引擎 + darwin 四通道 | VCPChat 插件 ScreenPilot |
+| `gsv-voice/` | 语音克隆 Metal 补丁 + 协议适配层 | KakaruHayate/gsv.cpp + VCPChat gsv-service |
